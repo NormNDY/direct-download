@@ -1,4 +1,4 @@
-name: "📥 Direct File Downloader"
+name: "📥 Direct File Downloader (Robust Push)"
 
 on:
   workflow_dispatch:
@@ -80,7 +80,6 @@ jobs:
           set -euo pipefail
           mkdir -p downloads logs
 
-          # اعمال پروکسی
           ${{ steps.proxy.outputs.proxy_env }} || true
 
           read -ra URL_LIST <<< "$URLS"
@@ -90,7 +89,6 @@ jobs:
             COUNTER=$((COUNTER + 1))
             echo "▸ دانلود: $URL"
 
-            # تعیین نام پوشه و فایل
             SAFE_NAME=$(echo "$URL" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-50)
             if [ -n "$PREFIX" ]; then
               FOLDER_NAME="${PREFIX}_${COUNTER}"
@@ -102,11 +100,9 @@ jobs:
             LOG_FILE="$OUT_DIR/debug.log"
             echo "===== شروع دانلود در $(date) =====" > "$LOG_FILE"
 
-            # حدس پسوند از URL
             EXT=$(echo "$URL" | grep -oP '\.\w{2,4}$' || echo "dat")
             FILENAME="download.${EXT}"
 
-            echo "📥 دریافت فایل ..." | tee -a "$LOG_FILE"
             set +e
             curl -L --retry 10 --retry-delay 5 --retry-max-time 60 \
               -C - \
@@ -124,7 +120,6 @@ jobs:
             SIZE=$(du -m "${OUT_DIR}/${FILENAME}" | cut -f1)
             echo "✅ فایل دریافت شد (${SIZE}MB)" | tee -a "$LOG_FILE"
 
-            # مدیریت اندازه و تقسیم
             if [ "$SPLIT_SIZE" != "0" ] && [ "$SIZE" -gt "$SPLIT_SIZE" ]; then
               echo "📦 تقسیم فایل به قطعات ${SPLIT_SIZE}MB ..." | tee -a "$LOG_FILE"
               cd "$OUT_DIR"
@@ -134,18 +129,18 @@ jobs:
                 zip -0 -s ${SPLIT_SIZE}m "${FOLDER_NAME}.zip" "$FILENAME"
               fi
               cd ../..
-              echo "✅ قطعات ساخته شدند." | tee -a "$LOG_FILE"
-              # حذف فایل اصلی (در صورت تمایل؛ می‌توان نگه داشت)
               rm -f "${OUT_DIR}/${FILENAME}"
             else
-              # اگر نیاز به رمز باشد (بدون تقسیم)
               if [ -n "$ZIP_PASSWORD" ]; then
                 7z a -tzip -p"$ZIP_PASSWORD" -mx0 "${OUT_DIR}/${FOLDER_NAME}.zip" "${OUT_DIR}/${FILENAME}"
                 rm -f "${OUT_DIR}/${FILENAME}"
               fi
+              # هشدار اگر فایل بزرگتر از ۹۵ مگابایت است
+              if [ "$SIZE" -gt 95 ]; then
+                echo "⚠️ هشدار: فایل بزرگتر از ۹۵ مگابایت است و ممکن است گیت‌هاب نتواند آن را Push کند." | tee -a "$LOG_FILE"
+              fi
             fi
 
-            # ساخت README
             echo "# 📥 فایل دانلودی" > "$OUT_DIR/README.md"
             echo "" >> "$OUT_DIR/README.md"
             echo "🔗 لینک اصلی: $URL" >> "$OUT_DIR/README.md"
@@ -159,17 +154,48 @@ jobs:
             done
           done
 
-      - name: 📤 Push فایل‌ها
+      - name: 📤 Push مقاوم در برابر خطا
         if: always()
         run: |
+          set +e
           git config user.name "github-actions"
           git config user.email "actions@github.com"
+
           git add downloads/
+
           if ! git diff --cached --quiet; then
-            TOTAL=$(find downloads -type f -not -name '*.log' -not -name 'README.md' | wc -l)
-            git commit -m "📥 آپلود فایل‌های جدید ($TOTAL فایل)"
-            git pull --rebase origin main 2>/dev/null || true
-            git push origin main
+            TOTAL_FILES=$(find downloads -type f -not -name '*.log' -not -name 'README.md' | wc -l)
+            git commit -m "📥 آپلود فایل‌های جدید ($TOTAL_FILES فایل)"
+
+            echo "📤 تلاش برای Push..."
+
+            # جلوگیری از تداخل
+            git stash 2>/dev/null || true
+            git pull --rebase origin "${GITHUB_REF_NAME}" || {
+              echo "⚠️ خطا در pull، تلاش مستقیم..."
+              git rebase --abort 2>/dev/null || true
+              git pull origin "${GITHUB_REF_NAME}" --no-rebase || echo "ادامه بدون pull"
+            }
+            git stash pop 2>/dev/null || true
+
+            # تلاش ۳ باره
+            PUSH_OK=false
+            for i in 1 2 3; do
+              if git push origin "${GITHUB_REF_NAME}"; then
+                echo "✅ Push موفق بود"
+                PUSH_OK=true
+                break
+              else
+                echo "⚠️ تلاش $i برای Push ناموفق، صبر کنید..."
+                sleep 3
+              fi
+            done
+
+            if [ "$PUSH_OK" = false ]; then
+              echo "❌ Push نهایی نشد. ممکن است برخی فایل‌ها بزرگتر از حد مجاز باشند."
+              echo "💡 پیشنهاد: از گزینهٔ تقسیم فایل (split_size = 45) استفاده کنید."
+            fi
           else
-            echo "بدون تغییر"
+            echo "ℹ️ هیچ تغییری برای Commit وجود ندارد."
           fi
+          set -e
