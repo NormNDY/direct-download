@@ -1,0 +1,175 @@
+name: "📥 Direct File Downloader"
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_urls:
+        description: '🔗 لینک مستقیم فایل‌ها (با فاصله جدا کنید)'
+        required: true
+        type: string
+      output_prefix:
+        description: '🏷️ پیشوند نام فایل (اختیاری)'
+        required: false
+        default: ''
+      zip_password:
+        description: '🔒 رمز فایل ZIP (اختیاری)'
+        required: false
+        default: ''
+      split_size:
+        description: '📦 حجم قطعات (MB) — 0 یعنی تقسیم نشود'
+        required: true
+        default: '45'
+        type: choice
+        options: ['0', '45', '95']
+      custom_proxy:
+        description: '🌐 پروکسی دستی (مثال http://1.2.3.4:8080)'
+        required: false
+        default: ''
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  download-files:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔧 نصب ابزارها
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl wget zip p7zip-full
+
+      - name: 🛡️ تنظیم پروکسی (WARP یا دستی)
+        id: proxy
+        run: |
+          if [ -n "$CUSTOM" ]; then
+            echo "🔹 پروکسی دستی: $CUSTOM"
+            echo "proxy_env=export http_proxy=$CUSTOM https_proxy=$CUSTOM" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "🛡️ راه‌اندازی WARP..."
+          docker run -d --name warp --restart=always \
+            -p 1080:1080 --cap-add NET_ADMIN \
+            -e WARP_ENABLE_WARP=yes \
+            caomingjun/warp
+          sleep 25
+          if curl -x socks5h://127.0.0.1:1080 -s --max-time 10 https://www.google.com > /dev/null; then
+            echo "proxy_env=export http_proxy=socks5h://127.0.0.1:1080 https_proxy=socks5h://127.0.0.1:1080" >> $GITHUB_OUTPUT
+            echo "✅ WARP فعال"
+          else
+            echo "proxy_env=" >> $GITHUB_OUTPUT
+            echo "⚠️ WARP در دسترس نیست، ادامه بدون پروکسی"
+          fi
+        env:
+          CUSTOM: ${{ github.event.inputs.custom_proxy }}
+
+      - name: ⬇️ دانلود فایل‌ها
+        env:
+          URLS: ${{ github.event.inputs.file_urls }}
+          PREFIX: ${{ github.event.inputs.output_prefix }}
+          SPLIT_SIZE: ${{ github.event.inputs.split_size }}
+          ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
+        run: |
+          set -euo pipefail
+          mkdir -p downloads logs
+
+          # اعمال پروکسی
+          ${{ steps.proxy.outputs.proxy_env }} || true
+
+          read -ra URL_LIST <<< "$URLS"
+          COUNTER=0
+
+          for URL in "${URL_LIST[@]}"; do
+            COUNTER=$((COUNTER + 1))
+            echo "▸ دانلود: $URL"
+
+            # تعیین نام پوشه و فایل
+            SAFE_NAME=$(echo "$URL" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-50)
+            if [ -n "$PREFIX" ]; then
+              FOLDER_NAME="${PREFIX}_${COUNTER}"
+            else
+              FOLDER_NAME="file_${COUNTER}_${SAFE_NAME}"
+            fi
+            OUT_DIR="downloads/${FOLDER_NAME}"
+            mkdir -p "$OUT_DIR"
+            LOG_FILE="$OUT_DIR/debug.log"
+            echo "===== شروع دانلود در $(date) =====" > "$LOG_FILE"
+
+            # حدس پسوند از URL
+            EXT=$(echo "$URL" | grep -oP '\.\w{2,4}$' || echo "dat")
+            FILENAME="download.${EXT}"
+
+            echo "📥 دریافت فایل ..." | tee -a "$LOG_FILE"
+            set +e
+            curl -L --retry 10 --retry-delay 5 --retry-max-time 60 \
+              -C - \
+              -o "${OUT_DIR}/${FILENAME}" \
+              "$URL" 2>&1 | tee -a "$LOG_FILE"
+            CURL_EXIT=$?
+            set -e
+
+            if [ $CURL_EXIT -ne 0 ] || [ ! -s "${OUT_DIR}/${FILENAME}" ]; then
+              echo "❌ دانلود شکست خورد" | tee -a "$LOG_FILE"
+              printf "# ❌ دانلود ناموفق\n\nخطا در دریافت فایل.\n" > "$OUT_DIR/README.md"
+              continue
+            fi
+
+            SIZE=$(du -m "${OUT_DIR}/${FILENAME}" | cut -f1)
+            echo "✅ فایل دریافت شد (${SIZE}MB)" | tee -a "$LOG_FILE"
+
+            # مدیریت اندازه و تقسیم
+            if [ "$SPLIT_SIZE" != "0" ] && [ "$SIZE" -gt "$SPLIT_SIZE" ]; then
+              echo "📦 تقسیم فایل به قطعات ${SPLIT_SIZE}MB ..." | tee -a "$LOG_FILE"
+              cd "$OUT_DIR"
+              if [ -n "$ZIP_PASSWORD" ]; then
+                7z a -tzip -v${SPLIT_SIZE}m -p"$ZIP_PASSWORD" -mx0 "${FOLDER_NAME}.zip" "$FILENAME"
+              else
+                zip -0 -s ${SPLIT_SIZE}m "${FOLDER_NAME}.zip" "$FILENAME"
+              fi
+              cd ../..
+              echo "✅ قطعات ساخته شدند." | tee -a "$LOG_FILE"
+              # حذف فایل اصلی (در صورت تمایل؛ می‌توان نگه داشت)
+              rm -f "${OUT_DIR}/${FILENAME}"
+            else
+              # اگر نیاز به رمز باشد (بدون تقسیم)
+              if [ -n "$ZIP_PASSWORD" ]; then
+                7z a -tzip -p"$ZIP_PASSWORD" -mx0 "${OUT_DIR}/${FOLDER_NAME}.zip" "${OUT_DIR}/${FILENAME}"
+                rm -f "${OUT_DIR}/${FILENAME}"
+              fi
+            fi
+
+            # ساخت README
+            echo "# 📥 فایل دانلودی" > "$OUT_DIR/README.md"
+            echo "" >> "$OUT_DIR/README.md"
+            echo "🔗 لینک اصلی: $URL" >> "$OUT_DIR/README.md"
+            echo "📏 حجم: ${SIZE}MB" >> "$OUT_DIR/README.md"
+            echo "" >> "$OUT_DIR/README.md"
+            echo "## 🔽 لینک‌های Raw" >> "$OUT_DIR/README.md"
+            for f in $(ls -1 "$OUT_DIR"); do
+              [ "$f" = "README.md" ] || [ "$f" = "debug.log" ] && continue
+              RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/downloads/${FOLDER_NAME}/${f}"
+              echo "- [${f}](${RAW_URL})" >> "$OUT_DIR/README.md"
+            done
+          done
+
+      - name: 📤 Push فایل‌ها
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add downloads/
+          if ! git diff --cached --quiet; then
+            TOTAL=$(find downloads -type f -not -name '*.log' -not -name 'README.md' | wc -l)
+            git commit -m "📥 آپلود فایل‌های جدید ($TOTAL فایل)"
+            git pull --rebase origin main 2>/dev/null || true
+            git push origin main
+          else
+            echo "بدون تغییر"
+          fi
